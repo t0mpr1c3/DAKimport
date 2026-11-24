@@ -4,6 +4,7 @@ import sys
 import numpy as np
 from collections import Counter
 from PIL import Image
+from .stp import read_stp
 # import png
 
 
@@ -307,138 +308,23 @@ class DAKPatternConverter:
 		return self.__output_im()
 
 	# read DAK .stp file and return a PIL.Image object
+	#
+	# Decoding is done by DAKimport.stp (see docs/STP_FORMAT.md), which also
+	# exposes stitch types, cables, stitch definitions and row yarn data.
+	# Raises DAKimport.stp.STPError for invalid files.
 	def stp2im(self, filename):
-
-		def __calc_key(data):
-
-			def __appendKeystring(next_string, max_size):
-				return (keystring + next_string)[0:max_size]
-
-			key1 = (getDWordAt(data, 0x35) >> 1)
-			key1 += (getWordAt(data, 0x3F) << 2)
-			key1 += getDWordAt(data, 0x39) 
-			key1 += getWordAt(data, 0x3D)
-			key1 += getByteAt(data, 0x20);
-			if self.debug:
-				print("first key number {}".format(key1))
-			salt1 = getWordAt(data, 0x39);
-			salt2 = int((getDWordAt(data, 0x35) & 0xFFFF) > 0)
-			keystring = getStringAt(data, 0x60)
-			keystring = __appendKeystring(getStringAt(data, 0x41),    0x6E)
-			keystring = __appendKeystring(str(getWordAt(data, 0x3D)), 0x7D) 
-			keystring = __appendKeystring(str(getByteAt(data, 0x20)), 0x8C) 
-			keystring = __appendKeystring(getStringAt(data, 0x41),    0xAA) 
-			keystring = __appendKeystring(str(getByteAt(data, 0x20)), 0xB9) 
-			keystring = __appendKeystring(str(getWordAt(data, 0x3D)), 0xC8)
-			if self.debug:
-				print("first key string '{}'".format(keystring))
-			key2 = key1 
-			for i in range(len(keystring)):
-				b = ord(keystring[i]) // 2
-				switch = (i + 1) % 3
-				if switch == 0:
-					temp = (salt2 + b) // 7
-					key2 += (i + 1) * b + temp
-				elif switch == 1:
-					temp = b // 5 * getWordAt(data, 0x3F);
-					key2 += (i + 1) * salt2;
-					key2 += b * 6;
-					key2 += temp;
-				else: ## switch == 2
-					key2 += (i + 1) * salt1;
-					key2 += b * 4;
-			if self.debug:
-				print("second key number {}".format(key2))
-			keystring = str(key2 * 3)
-			keystring = __appendKeystring(str(key2),     0x1E)
-			keystring = __appendKeystring(str(key2 * 4), 0x2D)
-			keystring = __appendKeystring(str(key2 * 2), 0x3C)
-			keystring = __appendKeystring(str(key2 * 5), 0x4B)
-			keystring = __appendKeystring(str(key2 * 6), 0x5A)
-			keystring = __appendKeystring(str(key2 * 8), 0x69)
-			keystring = __appendKeystring(str(key2 * 7), 0x78)
-			if self.debug:
-				print("second key string '{}'".format(keystring))
-			xorkey = bytearray(max_xor_len)
-			for i in range(max_xor_len):
-				index = (i + 1) % len(keystring)
-				temp1 = ord(keystring[index]) & 0xFF
-				temp2 = key2 % (i + 1) & 0xFF
-				xorkey[i] = temp1 ^ temp2
-			return xorkey
-
-		def __decrypt_next_block(pos):
-			blocks = []
-			while True:
-				block = STPBlock(input_data, pos, xorkey)
-				blocks.append(block)
-				pos += block.size + 4
-				if block.height == self.height:
-					return blocks, pos
-
-		# decode run length encoding of color and stitch patterns
-		def __decode_runs(data, blocks, offset):
-			output = np.zeros((self.height, self.width), np.uint8)
-			block_num = 0
-			block_data = blocks[0].data
-			pos = 0
-			for row in range(self.height):
-				if row == blocks[block_num].height:
-					block_num += 1
-					block_data = blocks[block_num].data
-					pos = 0
-				column = 0
-				while column < self.width:
-					run = 1
-					symbol = getByteAt(block_data, pos)
-					pos += 1
-					if symbol & 0x80:
-						run = symbol & 0x7F
-						symbol = getByteAt(block_data, pos)
-						pos += 1
-					# if offset:
-						# symbol = getByteAt(data, offset + symbol * 2 - 2)
-					if run > 0:
-						for i in range(run):
-							output[row, column] = symbol
-							column += 1
-			return output
-
-		## constants
-		max_xor_len = 21000
-		color_block_start = 0xF8
-		color_data_size = 1775 ## 71 colors * 25 bytes
-		#
-		## read data
-		input_data = self.__read_data(filename)
-		#
-		## check data
-		self.__check_header(input_data[0:3], (b'D7c',))
-		self.__check_dims(input_data, 3, 5, 500, 3000)
-		# self.status = 0
-		#
-		## calculate key for decryption
-		xorkey = __calc_key(input_data)
-		#
-		## decrypt data blocks
-		color_blocks, stitch_block_start = __decrypt_next_block(color_block_start)
-		stitch_blocks, color_data_start = __decrypt_next_block(stitch_block_start)
-		# stitch_data_start = color_data_start + color_data_size
+		pattern = read_stp(filename)
+		self.__init__()
+		self.filename = filename
+		self.width = pattern.width
+		self.height = pattern.height
+		self.color_pattern = np.array([list(row) for row in pattern.color_pattern],
+			np.uint8)
+		for color in pattern.colors:
+			if color.flags & 0x10:
+				self.colors[color.index] = DAKColor(binary = color.raw)
 		if self.debug:
-			print("start of color data {}".format(hex(color_data_start)))
-			# print("start of stitch data {}".format(hex(stitch_data_start)))
-		#
-		## get pattern, color, and stitch data
-		self.color_pattern = __decode_runs(input_data, color_blocks, 0)
-		# self.stitch_pattern = decode_runs(input_data, stitch_blocks, color_data_size)
-		self.__read_colors(input_data, color_data_start)
-		# self.read_stitches(input_data, stitch_data_start)
-		# if self.debug:
-			# print(input_data[stitch_data_start:stitch_data_start+0x100])
-			# print(self.colors)
-		#
-		## done
-		# return self.status
-		return self.__output_im()
+			print("width {} height {}".format(self.width, self.height))
+		return pattern.color_image()
 
 # end of DAKPatternConverter class definition
